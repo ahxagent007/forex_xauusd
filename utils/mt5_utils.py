@@ -1,6 +1,7 @@
 import json
 import os
-
+import time
+import math
 import MetaTrader5 as mt5
 from datetime import datetime, timedelta
 import matplotlib.  pyplot as plt
@@ -1309,6 +1310,24 @@ def move_sl_to_be(position, buffer_points=20):
 
     return result
 
+def move_sl(position, sl_price):
+
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "position": position.ticket,   # 🔴 REQUIRED
+        "sl": sl_price,                # new SL
+        "tp": position.tp,             # 🔴 KEEP TP
+    }
+
+    result = mt5.order_send(request)
+
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        print("✅ SL moved")
+    else:
+        print("❌ Failed to move SL:", result.comment)
+
+    return result
+
 def atr_sl_tp(entry, type, atr, sl_mult=1.3, tp_mult=3.0):
     if type == 0: # 0 BUY 1 SELL
         sl = entry - atr * sl_mult
@@ -1336,3 +1355,132 @@ def set_sl_tp(position, sl, tp):
         "tp": tp
     }
     return mt5.order_send(request)
+
+
+
+BUY = 0
+SELL = 1
+
+def _round_volume(symbol: str, vol: float) -> float:
+    """
+    Round volume to broker's lot step and clamp to [min_lot, max_lot].
+    """
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        raise RuntimeError(f"symbol_info({symbol}) failed")
+
+    min_lot = float(info.volume_min)
+    max_lot = float(info.volume_max)
+    step = float(info.volume_step)
+
+    # clamp
+    vol = max(min(vol, max_lot), 0.0)
+
+    if vol < min_lot:
+        return 0.0
+
+    # round DOWN to step (safer than rounding up)
+    steps = math.floor((vol - min_lot) / step + 1e-12)
+    rounded = min_lot + steps * step
+
+    # final clamp & precision (MT5 likes 2 decimals typically, but step can vary)
+    rounded = max(min(rounded, max_lot), min_lot)
+    # keep sane decimals
+    rounded = float(f"{rounded:.4f}")
+    return rounded
+
+def close_position(pos, close_vol: float, deviation: int = 20, magic: int = 0, comment: str = "partial_close"):
+    """
+    Partially (or fully) close an open MT5 position by sending an opposite market deal.
+
+    Parameters
+    ----------
+    pos : position object (from mt5.positions_get or your wrapper)
+        Must have attributes: ticket, symbol, type, volume
+    close_vol : float
+        Volume to close. If >= pos.volume -> full close.
+    deviation : int
+        Max price slippage in points.
+    magic : int
+        Magic number if you use one (optional).
+    comment : str
+        Trade comment.
+
+    Returns
+    -------
+    result : mt5.OrderSendResult
+        The result returned by mt5.order_send()
+
+    Raises
+    ------
+    RuntimeError on failure (with MT5 last_error info)
+    """
+    symbol = getattr(pos, "symbol", None)
+    ticket = getattr(pos, "ticket", None)
+    ptype = getattr(pos, "type", None)
+    pvol = float(getattr(pos, "volume", 0.0))
+
+    if not symbol or ticket is None or ptype is None or pvol <= 0:
+        raise ValueError("pos must have symbol, ticket, type, volume")
+
+    # Ensure symbol is selectable
+    if not mt5.symbol_select(symbol, True):
+        raise RuntimeError(f"symbol_select({symbol}) failed: {mt5.last_error()}")
+
+    # Volume to close (clamp to position volume)
+    req_vol = min(float(close_vol), pvol)
+    req_vol = _round_volume(symbol, req_vol)
+
+    if req_vol <= 0:
+        raise ValueError(f"Requested close_vol too small after rounding for {symbol}")
+
+    # Opposite order type to reduce/close the position
+    if ptype == BUY:
+        order_type = mt5.ORDER_TYPE_SELL
+        price = mt5.symbol_info_tick(symbol).bid
+    else:
+        order_type = mt5.ORDER_TYPE_BUY
+        price = mt5.symbol_info_tick(symbol).ask
+
+    if price is None or price == 0:
+        raise RuntimeError(f"Tick price unavailable for {symbol}: {mt5.last_error()}")
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": req_vol,
+        "type": order_type,
+        "position": int(ticket),     # IMPORTANT: closes against this position ticket
+        "price": float(price),
+        "deviation": int(deviation),
+        "magic": int(magic),
+        "comment": str(comment),
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_FOK,  # you can change to IOC if your broker prefers
+    }
+
+    result = mt5.order_send(request)
+
+    # Sometimes brokers reject FOK; optional retry with IOC
+    if result is None:
+        raise RuntimeError(f"order_send returned None: {mt5.last_error()}")
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        # retry once with IOC (common fix)
+        request["type_filling"] = mt5.ORDER_FILLING_IOC
+        time.sleep(0.05)
+        result2 = mt5.order_send(request)
+        if result2 is None:
+            raise RuntimeError(f"order_send retry returned None: {mt5.last_error()}")
+        if result2.retcode != mt5.TRADE_RETCODE_DONE:
+            raise RuntimeError(
+                f"Close failed retcode={result2.retcode}, comment={result2.comment}, last_error={mt5.last_error()}"
+            )
+        return result2
+
+    return result
+
+
+def get_symbol_volume_rules(symbol: str):
+    info = mt5.symbol_info(symbol)
+    return float(info.volume_min), float(info.volume_step), float(info.volume_max)
