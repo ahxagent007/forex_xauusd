@@ -173,11 +173,11 @@ def per_min_ema(symbol: str = "BTCUSD"):
     time_frame = "M1"
 
     # ===== Tunables you requested =====
-    TP_RR = 2.0                 # TP at 2R (true R-based)
-    PARTIAL_RR = 1.0            # take partial profit at +1R
+    TP_RR = 4.0                 # TP at 2R (true R-based)
+    PARTIAL_RR = 1.5            # take partial profit at +1R
     PARTIAL_FRACTION = 0.5      # close 50% at +1R
 
-    SL_ATR_MULT = 1.3           # SL distance from ATR
+    SL_ATR_MULT = 2.0           # SL distance from ATR
     TRAIL_ATR_MULT = 1.0        # trailing aggressiveness (after BE/partial)
     MOVE_BE_AFTER_PARTIAL = True
 
